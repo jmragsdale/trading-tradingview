@@ -5,7 +5,6 @@ Collection of TradingView Pine Script indicators for ICT (Inner Circle Trader) c
 ## Scripts
 
 - **ICT_Crypto_Displacement_Block_v6.pine** - Displacement block indicator for crypto markets
-- **ICT_HTF_Suspension_Block_v6.pine** - Higher timeframe suspension block indicator
 
 ## Usage
 
@@ -20,5 +19,5 @@ These scripts are designed for use on TradingView platform. To use:
 
 These indicators implement ICT trading concepts including:
 - Displacement blocks
-- Suspension blocks
-- Higher timeframe analysis
+- Market structure analysis
+- Higher timeframe context
