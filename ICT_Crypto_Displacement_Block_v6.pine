@@ -1,0 +1,515 @@
+//@version=6
+indicator("ICT Crypto Displacement Block [v6]", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ==================== OVERVIEW ====================
+// This indicator is designed for 24/7 crypto markets where true gaps don't exist.
+// Instead of detecting suspension blocks (which require gaps), it detects:
+// 1. DISPLACEMENT CANDLES - Large, impulsive candles that show institutional activity
+// 2. The dealing range created by these candles
+// 3. Volume imbalances within the candle (wick zones where price moved too fast)
+// 
+// TRADING LOGIC:
+// - Bullish Displacement: Look to BUY when price retraces into discount of the candle
+// - Bearish Displacement: Look to SELL when price retraces into premium of the candle
+
+// ==================== INPUTS ====================
+string GRP_HTF = "═══ Higher Timeframe Settings ═══"
+string htf_period    = input.timeframe("240", "Higher Timeframe (HTF)", group = GRP_HTF)
+int    blocks_to_show = input.int(5, "Number of Blocks to Display", minval = 1, maxval = 20, group = GRP_HTF)
+int    extend_bars   = input.int(50, "Extend Blocks (bars)", minval = 5, maxval = 200, group = GRP_HTF)
+
+string GRP_DETECTION = "═══ Displacement Detection ═══"
+float  body_multiplier = input.float(1.5, "Body Size Multiplier (vs ATR)", minval = 1.0, maxval = 5.0, step = 0.1, group = GRP_DETECTION, tooltip = "Candle body must be this many times larger than ATR to qualify as displacement")
+int    atr_length    = input.int(14, "ATR Length", minval = 5, maxval = 50, group = GRP_DETECTION)
+float  min_body_pct  = input.float(60.0, "Min Body % of Range", minval = 40.0, maxval = 90.0, step = 5.0, group = GRP_DETECTION, tooltip = "Body must be at least this % of total candle range (filters out dojis)")
+bool   require_close_strong = input.bool(true, "Require Strong Close", group = GRP_DETECTION, tooltip = "Bullish must close in upper 30%, Bearish in lower 30%")
+
+string GRP_FVG = "═══ Fair Value Gap Detection ═══"
+bool   show_fvg      = input.bool(true, "Show FVGs (3-candle gaps)", group = GRP_FVG)
+int    fvg_to_show   = input.int(5, "Number of FVGs to Display", minval = 1, maxval = 20, group = GRP_FVG)
+
+string GRP_COLORS = "═══ Colors ═══"
+color  db_bull_col   = input.color(color.new(#00ff88, 75), "Bullish Block Fill", group = GRP_COLORS)
+color  db_bear_col   = input.color(color.new(#ff3d5d, 75), "Bearish Block Fill", group = GRP_COLORS)
+color  fvg_bull_col  = input.color(color.new(#00ff88, 85), "Bullish FVG Fill", group = GRP_COLORS)
+color  fvg_bear_col  = input.color(color.new(#ff3d5d, 85), "Bearish FVG Fill", group = GRP_COLORS)
+color  wick_col      = input.color(color.new(color.yellow, 80), "Wick Zone Fill", group = GRP_COLORS)
+color  quad_col      = input.color(color.new(color.white, 40), "Quadrant Lines", group = GRP_COLORS)
+color  entry_col     = input.color(color.new(#00bfff, 0), "Entry Line", group = GRP_COLORS)
+color  sl_col        = input.color(color.new(#ff4444, 0), "Stop Loss", group = GRP_COLORS)
+color  tp_col        = input.color(color.new(#44ff44, 0), "Take Profit", group = GRP_COLORS)
+
+string GRP_FEATURES = "═══ Features ═══"
+bool   show_wick_zones = input.bool(true, "Show Wick Zones (Imbalance)", group = GRP_FEATURES)
+bool   show_quadrants = input.bool(true, "Show Quadrant Lines (25/50/75%)", group = GRP_FEATURES)
+bool   show_mss      = input.bool(true, "Show MSS Signals", group = GRP_FEATURES)
+bool   show_trade_levels = input.bool(true, "Show Entry/SL/TP on MSS", group = GRP_FEATURES)
+bool   show_zone_alerts  = input.bool(true, "Alert on Optimal Zone Entry", group = GRP_FEATURES)
+bool   show_db_label = input.bool(true, "Show Block Labels", group = GRP_FEATURES)
+
+string GRP_KILLZONE = "═══ Kill Zone Filter ═══"
+bool   use_killzones = input.bool(false, "Only Show MSS During Kill Zones", group = GRP_KILLZONE)
+bool   kz_asian      = input.bool(false, "Asian Session (20:00-00:00 NY)", group = GRP_KILLZONE)
+bool   kz_london     = input.bool(true, "London Session (02:00-05:00 NY)", group = GRP_KILLZONE)
+bool   kz_ny_am      = input.bool(true, "NY AM Session (07:00-10:00 NY)", group = GRP_KILLZONE)
+bool   kz_ny_pm      = input.bool(false, "NY PM Session (13:30-16:00 NY)", group = GRP_KILLZONE)
+
+// ==================== KILL ZONE LOGIC ====================
+ny_hour = hour(time, "America/New_York")
+ny_minute = minute(time, "America/New_York")
+ny_time_decimal = ny_hour + ny_minute / 60.0
+
+bool in_asian_kz  = kz_asian and (ny_time_decimal >= 20.0 or ny_time_decimal < 0.0)
+bool in_london_kz = kz_london and (ny_time_decimal >= 2.0 and ny_time_decimal < 5.0)
+bool in_ny_am_kz  = kz_ny_am and (ny_time_decimal >= 7.0 and ny_time_decimal < 10.0)
+bool in_ny_pm_kz  = kz_ny_pm and (ny_time_decimal >= 13.5 and ny_time_decimal < 16.0)
+
+bool in_any_killzone = in_asian_kz or in_london_kz or in_ny_am_kz or in_ny_pm_kz
+bool killzone_filter_passed = not use_killzones or in_any_killzone
+
+// ==================== HTF DATA EXTRACTION ====================
+htf_data() =>
+    float _atr = ta.atr(atr_length)
+    [high, low, open, close, high[1], low[1], high[2], low[2], _atr, time, bar_index]
+
+[htf_h, htf_l, htf_o, htf_c, htf_h1, htf_l1, htf_h2, htf_l2, htf_atr, htf_time, htf_bar] = request.security(syminfo.tickerid, htf_period, htf_data(), lookahead = barmerge.lookahead_off)
+
+// ==================== DISPLACEMENT BLOCK DETECTION ====================
+// Calculate candle metrics
+float candle_range = htf_h - htf_l
+float body_size = math.abs(htf_c - htf_o)
+float body_top = math.max(htf_o, htf_c)
+float body_bot = math.min(htf_o, htf_c)
+float upper_wick = htf_h - body_top
+float lower_wick = body_bot - htf_l
+
+// Body percentage of total range
+float body_pct = candle_range > 0 ? (body_size / candle_range) * 100 : 0
+
+// Close position within range (0 = low, 100 = high)
+float close_position = candle_range > 0 ? ((htf_c - htf_l) / candle_range) * 100 : 50
+
+// Displacement criteria
+bool is_large_body = body_size > (htf_atr * body_multiplier)
+bool is_full_body = body_pct >= min_body_pct
+bool is_bullish_candle = htf_c > htf_o
+bool is_bearish_candle = htf_c < htf_o
+
+// Strong close criteria
+bool strong_bull_close = close_position >= 70
+bool strong_bear_close = close_position <= 30
+
+// Final displacement detection
+bool bullish_displacement = is_large_body and is_full_body and is_bullish_candle and (not require_close_strong or strong_bull_close)
+bool bearish_displacement = is_large_body and is_full_body and is_bearish_candle and (not require_close_strong or strong_bear_close)
+
+// ==================== FVG DETECTION (3-Candle Pattern) ====================
+// Bullish FVG: Low of current candle > High of candle 2 bars ago
+// Bearish FVG: High of current candle < Low of candle 2 bars ago
+
+bool bullish_fvg = htf_l > htf_h2
+bool bearish_fvg = htf_h < htf_l2
+
+float fvg_bull_top = htf_l      // Bottom of current candle's range
+float fvg_bull_bot = htf_h2    // Top of candle 2 bars ago
+float fvg_bear_top = htf_l2    // Bottom of candle 2 bars ago  
+float fvg_bear_bot = htf_h      // Top of current candle's range
+
+// ==================== TRACK HTF BAR CHANGES ====================
+var int last_htf_bar = 0
+bool is_new_htf_bar = htf_bar != last_htf_bar and not na(htf_bar)
+
+if is_new_htf_bar
+    last_htf_bar := htf_bar
+
+// ==================== STORAGE ARRAYS ====================
+// Displacement blocks
+var array<box> db_boxes = array.new_box()
+var array<line> ce_lines = array.new_line()
+var array<line> uq_lines = array.new_line()
+var array<line> lq_lines = array.new_line()
+var array<box> wick_upper_boxes = array.new_box()
+var array<box> wick_lower_boxes = array.new_box()
+var array<label> db_labels = array.new_label()
+var array<bool> db_is_bull = array.new_bool()
+
+// FVG storage
+var array<box> fvg_boxes = array.new_box()
+var array<bool> fvg_is_bull = array.new_bool()
+
+// Trade levels
+var array<line> entry_lines = array.new_line()
+var array<line> sl_lines = array.new_line()
+var array<line> tp1_lines = array.new_line()
+var array<line> tp2_lines = array.new_line()
+var array<line> tp3_lines = array.new_line()
+var array<label> trade_labels = array.new_label()
+
+// Active block levels
+var float active_db_high = na
+var float active_db_low = na
+var float active_db_ce = na
+var float active_db_uq = na
+var float active_db_lq = na
+var bool active_db_is_bull = true
+var float active_wick_upper_top = na
+var float active_wick_upper_bot = na
+var float active_wick_lower_top = na
+var float active_wick_lower_bot = na
+
+// Zone tracking
+var bool was_in_buy_zone = false
+var bool was_in_sell_zone = false
+
+// Stats
+var int total_db_detected = 0
+var int total_fvg_detected = 0
+
+// ==================== DRAW DISPLACEMENT BLOCK ====================
+if is_new_htf_bar and (bullish_displacement or bearish_displacement)
+    total_db_detected += 1
+    
+    // Calculate quadrant levels
+    float range_size = htf_h - htf_l
+    float ce_level = htf_l + (range_size * 0.5)
+    float upper_quad = htf_l + (range_size * 0.75)
+    float lower_quad = htf_l + (range_size * 0.25)
+    
+    // Update active levels
+    active_db_high := htf_h
+    active_db_low := htf_l
+    active_db_ce := ce_level
+    active_db_uq := upper_quad
+    active_db_lq := lower_quad
+    active_db_is_bull := bullish_displacement
+    
+    // Wick zones (areas of imbalance within the candle)
+    active_wick_upper_top := htf_h
+    active_wick_upper_bot := body_top
+    active_wick_lower_top := body_bot
+    active_wick_lower_bot := htf_l
+    
+    // Reset zone tracking
+    was_in_buy_zone := false
+    was_in_sell_zone := false
+    
+    color db_color = bullish_displacement ? db_bull_col : db_bear_col
+    
+    // Draw block
+    box new_db = box.new(bar_index, htf_h, bar_index + extend_bars, htf_l,
+                         bgcolor = db_color,
+                         border_color = color.new(db_color, 0),
+                         border_width = 2)
+    array.push(db_boxes, new_db)
+    array.push(db_is_bull, bullish_displacement)
+    
+    // Draw wick zones
+    if show_wick_zones
+        // Upper wick zone
+        if upper_wick > 0
+            box new_wick_upper = box.new(bar_index, htf_h, bar_index + extend_bars, body_top,
+                                         bgcolor = wick_col, border_width = 0)
+            array.push(wick_upper_boxes, new_wick_upper)
+        
+        // Lower wick zone  
+        if lower_wick > 0
+            box new_wick_lower = box.new(bar_index, body_bot, bar_index + extend_bars, htf_l,
+                                         bgcolor = wick_col, border_width = 0)
+            array.push(wick_lower_boxes, new_wick_lower)
+    
+    // Draw quadrant lines
+    if show_quadrants
+        line new_ce = line.new(bar_index, ce_level, bar_index + extend_bars, ce_level,
+                               color = quad_col, style = line.style_dashed, width = 2)
+        line new_uq = line.new(bar_index, upper_quad, bar_index + extend_bars, upper_quad,
+                               color = quad_col, style = line.style_dotted, width = 1)
+        line new_lq = line.new(bar_index, lower_quad, bar_index + extend_bars, lower_quad,
+                               color = quad_col, style = line.style_dotted, width = 1)
+        array.push(ce_lines, new_ce)
+        array.push(uq_lines, new_uq)
+        array.push(lq_lines, new_lq)
+    
+    // Draw label
+    if show_db_label
+        string db_text = bullish_displacement ? "▲ BULL DISP" : "▼ BEAR DISP"
+        color lbl_color = bullish_displacement ? color.green : color.red
+        label new_lbl = label.new(bar_index, bullish_displacement ? htf_l : htf_h, db_text,
+                                  style = bullish_displacement ? label.style_label_up : label.style_label_down,
+                                  color = lbl_color, textcolor = color.white, size = size.normal)
+        array.push(db_labels, new_lbl)
+    
+    // Alert
+    string dir = bullish_displacement ? "BULLISH" : "BEARISH"
+    alert("🔥 " + dir + " DISPLACEMENT BLOCK\nHTF: " + htf_period + 
+          "\nHigh: " + str.tostring(htf_h, format.mintick) + 
+          "\nCE: " + str.tostring(ce_level, format.mintick) + 
+          "\nLow: " + str.tostring(htf_l, format.mintick) +
+          "\nBody: " + str.tostring(body_pct, "#.#") + "% | ATR x" + str.tostring(body_size/htf_atr, "#.##"), alert.freq_once_per_bar)
+    
+    // Cleanup old blocks
+    while array.size(db_boxes) > blocks_to_show
+        box.delete(array.shift(db_boxes))
+        array.shift(db_is_bull)
+    while array.size(ce_lines) > blocks_to_show
+        line.delete(array.shift(ce_lines))
+    while array.size(uq_lines) > blocks_to_show
+        line.delete(array.shift(uq_lines))
+    while array.size(lq_lines) > blocks_to_show
+        line.delete(array.shift(lq_lines))
+    while array.size(wick_upper_boxes) > blocks_to_show
+        box.delete(array.shift(wick_upper_boxes))
+    while array.size(wick_lower_boxes) > blocks_to_show
+        box.delete(array.shift(wick_lower_boxes))
+    while array.size(db_labels) > blocks_to_show
+        label.delete(array.shift(db_labels))
+
+// ==================== DRAW FVG ====================
+if is_new_htf_bar and show_fvg and (bullish_fvg or bearish_fvg)
+    total_fvg_detected += 1
+    
+    if bullish_fvg and fvg_bull_top > fvg_bull_bot
+        box new_fvg = box.new(bar_index, fvg_bull_top, bar_index + extend_bars, fvg_bull_bot,
+                              bgcolor = fvg_bull_col, border_color = color.new(fvg_bull_col, 50), border_width = 1)
+        array.push(fvg_boxes, new_fvg)
+        array.push(fvg_is_bull, true)
+    
+    if bearish_fvg and fvg_bear_top > fvg_bear_bot
+        box new_fvg = box.new(bar_index, fvg_bear_top, bar_index + extend_bars, fvg_bear_bot,
+                              bgcolor = fvg_bear_col, border_color = color.new(fvg_bear_col, 50), border_width = 1)
+        array.push(fvg_boxes, new_fvg)
+        array.push(fvg_is_bull, false)
+    
+    // Cleanup old FVGs
+    while array.size(fvg_boxes) > fvg_to_show
+        box.delete(array.shift(fvg_boxes))
+        array.shift(fvg_is_bull)
+
+// ==================== EXTEND BLOCKS ====================
+if array.size(db_boxes) > 0
+    int right_edge = bar_index + 5
+    
+    for i = 0 to array.size(db_boxes) - 1
+        array.get(db_boxes, i).set_right(right_edge)
+    
+    if show_quadrants
+        for i = 0 to math.min(array.size(ce_lines) - 1, array.size(db_boxes) - 1)
+            array.get(ce_lines, i).set_x2(right_edge)
+        for i = 0 to math.min(array.size(uq_lines) - 1, array.size(db_boxes) - 1)
+            array.get(uq_lines, i).set_x2(right_edge)
+        for i = 0 to math.min(array.size(lq_lines) - 1, array.size(db_boxes) - 1)
+            array.get(lq_lines, i).set_x2(right_edge)
+    
+    if show_wick_zones
+        if array.size(wick_upper_boxes) > 0
+            for i = 0 to array.size(wick_upper_boxes) - 1
+                array.get(wick_upper_boxes, i).set_right(right_edge)
+        if array.size(wick_lower_boxes) > 0
+            for i = 0 to array.size(wick_lower_boxes) - 1
+                array.get(wick_lower_boxes, i).set_right(right_edge)
+
+if array.size(fvg_boxes) > 0
+    int right_edge = bar_index + 5
+    for i = 0 to array.size(fvg_boxes) - 1
+        array.get(fvg_boxes, i).set_right(right_edge)
+
+// ==================== BIAS & ZONE LOGIC ====================
+bool is_discount = not na(active_db_ce) and close < active_db_ce
+bool is_premium  = not na(active_db_ce) and close > active_db_ce
+
+// Price within the displacement block range
+bool in_block_range = not na(active_db_high) and not na(active_db_low) and close <= active_db_high and close >= active_db_low
+
+bool in_buy_zone = false
+bool in_sell_zone = false
+
+if not na(active_db_lq) and not na(active_db_uq) and in_block_range
+    if active_db_is_bull
+        // Bullish block: Buy zone is discount (retracement into lower part)
+        in_buy_zone := is_discount
+    else
+        // Bearish block: Sell zone is premium (retracement into upper part)
+        in_sell_zone := is_premium
+
+// Zone alerts
+bool entered_buy_zone  = in_buy_zone and not was_in_buy_zone
+bool entered_sell_zone = in_sell_zone and not was_in_sell_zone
+
+if show_zone_alerts and entered_buy_zone and active_db_is_bull
+    alert("🟢 BUY ZONE: Price retraced into discount of BULLISH displacement block!", alert.freq_once_per_bar)
+
+if show_zone_alerts and entered_sell_zone and not active_db_is_bull
+    alert("🔴 SELL ZONE: Price retraced into premium of BEARISH displacement block!", alert.freq_once_per_bar)
+
+was_in_buy_zone := in_buy_zone
+was_in_sell_zone := in_sell_zone
+
+// ==================== MSS LOGIC ====================
+float swing_high = ta.highest(high, 5)
+float swing_low  = ta.lowest(low, 5)
+
+// MSS for Bullish block: Bullish displacement in discount zone
+bool raw_mss_bull = active_db_is_bull and in_buy_zone and ta.crossover(close, swing_high[1])
+
+// MSS for Bearish block: Bearish displacement in premium zone
+bool raw_mss_bear = not active_db_is_bull and in_sell_zone and ta.crossunder(close, swing_low[1])
+
+bool mss_bull = show_mss and raw_mss_bull and killzone_filter_passed and not na(active_db_ce)
+bool mss_bear = show_mss and raw_mss_bear and killzone_filter_passed and not na(active_db_ce)
+
+// ==================== TRADE LEVELS ====================
+clean_trade_levels() =>
+    while array.size(entry_lines) > 5
+        line.delete(array.shift(entry_lines))
+    while array.size(sl_lines) > 5
+        line.delete(array.shift(sl_lines))
+    while array.size(tp1_lines) > 5
+        line.delete(array.shift(tp1_lines))
+    while array.size(tp2_lines) > 5
+        line.delete(array.shift(tp2_lines))
+    while array.size(tp3_lines) > 5
+        line.delete(array.shift(tp3_lines))
+    while array.size(trade_labels) > 10
+        label.delete(array.shift(trade_labels))
+
+if mss_bull and show_trade_levels
+    int lvl_start = bar_index
+    int lvl_end = bar_index + 30
+    
+    float entry_price = close
+    float sl_price = active_db_low - (syminfo.mintick * 10)
+    float tp1_price = active_db_ce
+    float tp2_price = active_db_uq
+    float tp3_price = active_db_high
+    
+    array.push(entry_lines, line.new(lvl_start, entry_price, lvl_end, entry_price, color = entry_col, style = line.style_solid, width = 2))
+    array.push(sl_lines, line.new(lvl_start, sl_price, lvl_end, sl_price, color = sl_col, style = line.style_solid, width = 2))
+    array.push(tp1_lines, line.new(lvl_start, tp1_price, lvl_end, tp1_price, color = tp_col, style = line.style_dashed, width = 1))
+    array.push(tp3_lines, line.new(lvl_start, tp3_price, lvl_end, tp3_price, color = tp_col, style = line.style_solid, width = 2))
+    
+    array.push(trade_labels, label.new(lvl_end, entry_price, "ENTRY: " + str.tostring(entry_price, format.mintick), style = label.style_label_left, color = entry_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, sl_price, "SL: " + str.tostring(sl_price, format.mintick), style = label.style_label_left, color = sl_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, tp1_price, "TP1 (CE): " + str.tostring(tp1_price, format.mintick), style = label.style_label_left, color = tp_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, tp3_price, "TP3: " + str.tostring(tp3_price, format.mintick), style = label.style_label_left, color = tp_col, textcolor = color.white, size = size.small))
+    
+    clean_trade_levels()
+    
+    float risk = entry_price - sl_price
+    float reward = tp1_price - entry_price
+    float rr = risk > 0 ? reward / risk : 0
+    
+    alert("🟢 LONG MSS in BULLISH DISPLACEMENT\nEntry: " + str.tostring(entry_price, format.mintick) + 
+          "\nSL: " + str.tostring(sl_price, format.mintick) + 
+          "\nTP1: " + str.tostring(tp1_price, format.mintick) + 
+          "\nR:R: " + str.tostring(rr, "#.##"), alert.freq_once_per_bar)
+
+if mss_bear and show_trade_levels
+    int lvl_start = bar_index
+    int lvl_end = bar_index + 30
+    
+    float entry_price = close
+    float sl_price = active_db_high + (syminfo.mintick * 10)
+    float tp1_price = active_db_ce
+    float tp2_price = active_db_lq
+    float tp3_price = active_db_low
+    
+    array.push(entry_lines, line.new(lvl_start, entry_price, lvl_end, entry_price, color = entry_col, style = line.style_solid, width = 2))
+    array.push(sl_lines, line.new(lvl_start, sl_price, lvl_end, sl_price, color = sl_col, style = line.style_solid, width = 2))
+    array.push(tp1_lines, line.new(lvl_start, tp1_price, lvl_end, tp1_price, color = tp_col, style = line.style_dashed, width = 1))
+    array.push(tp3_lines, line.new(lvl_start, tp3_price, lvl_end, tp3_price, color = tp_col, style = line.style_solid, width = 2))
+    
+    array.push(trade_labels, label.new(lvl_end, entry_price, "ENTRY: " + str.tostring(entry_price, format.mintick), style = label.style_label_left, color = entry_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, sl_price, "SL: " + str.tostring(sl_price, format.mintick), style = label.style_label_left, color = sl_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, tp1_price, "TP1 (CE): " + str.tostring(tp1_price, format.mintick), style = label.style_label_left, color = tp_col, textcolor = color.white, size = size.small))
+    array.push(trade_labels, label.new(lvl_end, tp3_price, "TP3: " + str.tostring(tp3_price, format.mintick), style = label.style_label_left, color = tp_col, textcolor = color.white, size = size.small))
+    
+    clean_trade_levels()
+    
+    float risk = sl_price - entry_price
+    float reward = entry_price - tp1_price
+    float rr = risk > 0 ? reward / risk : 0
+    
+    alert("🔴 SHORT MSS in BEARISH DISPLACEMENT\nEntry: " + str.tostring(entry_price, format.mintick) + 
+          "\nSL: " + str.tostring(sl_price, format.mintick) + 
+          "\nTP1: " + str.tostring(tp1_price, format.mintick) + 
+          "\nR:R: " + str.tostring(rr, "#.##"), alert.freq_once_per_bar)
+
+// ==================== MSS SHAPES ====================
+plotshape(mss_bull, "Bullish MSS", shape.labelup, location.belowbar, color.green, text="MSS", textcolor=color.white, size=size.small)
+plotshape(mss_bear, "Bearish MSS", shape.labeldown, location.abovebar, color.red, text="MSS", textcolor=color.white, size=size.small)
+
+plotshape(show_mss and raw_mss_bull and not killzone_filter_passed, "Filtered Bull MSS", shape.labelup, location.belowbar, color.new(color.gray, 50), text="mss", textcolor=color.gray, size=size.tiny)
+plotshape(show_mss and raw_mss_bear and not killzone_filter_passed, "Filtered Bear MSS", shape.labeldown, location.abovebar, color.new(color.gray, 50), text="mss", textcolor=color.gray, size=size.tiny)
+
+// ==================== DASHBOARD ====================
+var table board = table.new(position.top_right, 2, 9, border_width = 1)
+
+if barstate.islast
+    string tf_display = htf_period == "D" ? "Daily" : htf_period == "W" ? "Weekly" : htf_period == "M" ? "Monthly" : htf_period == "240" ? "4H" : htf_period == "60" ? "1H" : htf_period + "m"
+    
+    string kz_status = not use_killzones ? "OFF" : in_london_kz ? "LONDON" : in_ny_am_kz ? "NY AM" : in_ny_pm_kz ? "NY PM" : in_asian_kz ? "ASIAN" : "WAITING"
+    color kz_color = not use_killzones ? color.gray : in_any_killzone ? color.blue : color.new(color.gray, 50)
+    
+    string db_type = na(active_db_ce) ? "NONE" : active_db_is_bull ? "BULLISH" : "BEARISH"
+    color db_type_col = na(active_db_ce) ? color.gray : active_db_is_bull ? color.green : color.red
+    
+    // Header
+    table.cell(board, 0, 0, tf_display + " DISP", bgcolor = color.gray, text_color = color.white)
+    table.cell(board, 1, 0, db_type, bgcolor = db_type_col, text_color = color.white)
+    
+    // Position
+    string pos_txt = na(active_db_ce) ? "N/A" : not in_block_range ? "OUT OF RANGE" : is_premium ? "PREMIUM" : "DISCOUNT"
+    color pos_col = na(active_db_ce) ? color.gray : not in_block_range ? color.gray : is_premium ? color.red : color.green
+    table.cell(board, 0, 1, "POSITION", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 1, pos_txt, bgcolor = pos_col, text_color = color.white)
+    
+    // Kill Zone
+    table.cell(board, 0, 2, "KILL ZONE", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 2, kz_status, bgcolor = kz_color, text_color = color.white)
+    
+    // Block High
+    table.cell(board, 0, 3, "BLOCK HIGH", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 3, na(active_db_high) ? "N/A" : str.tostring(active_db_high, format.mintick), bgcolor = color.black, text_color = color.white)
+    
+    // CE
+    table.cell(board, 0, 4, "CE (50%)", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 4, na(active_db_ce) ? "N/A" : str.tostring(active_db_ce, format.mintick), bgcolor = color.black, text_color = color.white)
+    
+    // Block Low
+    table.cell(board, 0, 5, "BLOCK LOW", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 5, na(active_db_low) ? "N/A" : str.tostring(active_db_low, format.mintick), bgcolor = color.black, text_color = color.white)
+    
+    // Stats
+    table.cell(board, 0, 6, "DISP BLOCKS", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 6, str.tostring(total_db_detected), bgcolor = color.black, text_color = color.yellow)
+    
+    table.cell(board, 0, 7, "FVGs", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 7, str.tostring(total_fvg_detected), bgcolor = color.black, text_color = color.yellow)
+    
+    // Status
+    string status_txt = "WAITING"
+    color status_col = color.gray
+    
+    if na(active_db_ce)
+        status_txt := "NO BLOCK"
+        status_col := color.gray
+    else if not in_block_range
+        status_txt := "OUT OF RANGE"
+        status_col := color.gray
+    else if in_buy_zone and active_db_is_bull
+        status_txt := "🎯 BUY ZONE"
+        status_col := color.green
+    else if in_sell_zone and not active_db_is_bull
+        status_txt := "🎯 SELL ZONE"
+        status_col := color.red
+    else if is_discount and active_db_is_bull
+        status_txt := "DISCOUNT"
+        status_col := color.new(color.green, 50)
+    else if is_premium and not active_db_is_bull
+        status_txt := "PREMIUM"
+        status_col := color.new(color.red, 50)
+    else
+        status_txt := "WRONG SIDE"
+        status_col := color.orange
+    
+    table.cell(board, 0, 8, "STATUS", bgcolor = color.new(color.gray, 20), text_color = color.white)
+    table.cell(board, 1, 8, status_txt, bgcolor = status_col, text_color = color.white)
