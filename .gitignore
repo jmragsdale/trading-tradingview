@@ -1,10 +1,35 @@
-# TradingView
-*.log
+# TradingView Pine Script
+*.pine.bak
 
-# OS
-.DS_Store
-Thumbs.db
+# Secrets & Credentials
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*
+*token*
+*.p12
+*.pfx
 
-# IDE
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# IDE & OS
 .vscode/
 .idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs & Build artifacts
+*.log
+logs/
+
+# OneNote exports
+*_onenote.html
